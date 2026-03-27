@@ -79,6 +79,30 @@ def custom_collate_fn(
         'status_feature': status_feature
     }
 
+    # --- UniAD track / map query embeddings (variable-length, padded) ---
+    if 'track_query_embeddings' in features_list[0]:
+        track_seqs = [f['track_query_embeddings'] for f in features_list]
+        track_padded = rnn_utils.pad_sequence(track_seqs, batch_first=True, padding_value=0.0)
+        features['track_query_embeddings'] = track_padded.clone().detach()
+        # Build padding mask: True where padded
+        track_lens = [s.shape[0] for s in track_seqs]
+        max_len = track_padded.shape[1]
+        features['track_query_mask'] = torch.stack([
+            torch.cat([torch.zeros(l, dtype=torch.bool), torch.ones(max_len - l, dtype=torch.bool)])
+            for l in track_lens
+        ])
+
+    if 'map_query_embeddings' in features_list[0]:
+        map_seqs = [f['map_query_embeddings'] for f in features_list]
+        map_padded = rnn_utils.pad_sequence(map_seqs, batch_first=True, padding_value=0.0)
+        features['map_query_embeddings'] = map_padded.clone().detach()
+        map_lens = [s.shape[0] for s in map_seqs]
+        max_len = map_padded.shape[1]
+        features['map_query_mask'] = torch.stack([
+            torch.cat([torch.zeros(l, dtype=torch.bool), torch.ones(max_len - l, dtype=torch.bool)])
+            for l in map_lens
+        ])
+
     targets = {
         'trajectory': trajectory
     }

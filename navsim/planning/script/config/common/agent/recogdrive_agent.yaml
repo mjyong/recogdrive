@@ -20,3 +20,5 @@ vlm_size: 'small'
 train_backbone: false
 grpo: False
 lr: 1e-4
+use_uniad_queries: False
+uniad_query_dim: 256

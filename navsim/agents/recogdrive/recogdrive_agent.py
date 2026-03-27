@@ -30,18 +30,20 @@ class ReCogDriveAgent(AbstractAgent):
         trajectory_sampling: TrajectorySampling,
         vlm_path: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
-        cam_type: Optional[str] = 'single', 
-        vlm_type: Optional[str] = 'internvl', 
-        dit_type: Optional[str] = 'small', 
-        sampling_method: Optional[str] = 'ddim', 
-        cache_mode: bool = False, 
-        cache_hidden_state: bool = True, 
+        cam_type: Optional[str] = 'single',
+        vlm_type: Optional[str] = 'internvl',
+        dit_type: Optional[str] = 'small',
+        sampling_method: Optional[str] = 'ddim',
+        cache_mode: bool = False,
+        cache_hidden_state: bool = True,
         lr: float = 1e-4,
         grpo: bool = False,
-        metric_cache_path: Optional[str] = '', 
-        reference_policy_checkpoint: Optional[str] = '', 
-        vlm_size: Optional[str] = 'small', 
+        metric_cache_path: Optional[str] = '',
+        reference_policy_checkpoint: Optional[str] = '',
+        vlm_size: Optional[str] = 'small',
         train_backbone: bool = False,
+        use_uniad_queries: bool = False,
+        uniad_query_dim: int = 256,
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -58,6 +60,8 @@ class ReCogDriveAgent(AbstractAgent):
         self.reference_policy_checkpoint = reference_policy_checkpoint
         self.vlm_size = vlm_size
         self.train_backbone = train_backbone
+        self.use_uniad_queries = use_uniad_queries
+        self.uniad_query_dim = uniad_query_dim
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -80,9 +84,9 @@ class ReCogDriveAgent(AbstractAgent):
                     p.requires_grad = True
 
         if self.dit_type == "large":
-            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=1536,sampling_method=sampling_method)
+            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=1536, sampling_method=sampling_method, use_uniad_queries=self.use_uniad_queries, uniad_query_dim=self.uniad_query_dim)
         elif self.dit_type == "small":
-            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=384,sampling_method=sampling_method)
+            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=384, sampling_method=sampling_method, use_uniad_queries=self.use_uniad_queries, uniad_query_dim=self.uniad_query_dim)
 
         cfg.vlm_size = self.vlm_size
 
@@ -121,6 +125,7 @@ class ReCogDriveAgent(AbstractAgent):
             checkpoint_path=self.vlm_path,
             device=self.device,
             cache_mode=self.cache_mode,
+            use_uniad_queries=self.use_uniad_queries,
         )]
 
     def forward(self, features: Dict[str, torch.Tensor], targets=None, tokens_list=None) -> Dict[str, torch.Tensor]:
@@ -198,15 +203,31 @@ class ReCogDriveAgent(AbstractAgent):
         history_trajectory_reshaped = history_trajectory.view(history_trajectory.size(0), -1)
         input_state = torch.cat([status_feature, history_trajectory_reshaped], dim=1)
 
+        # --- Extract optional UniAD query embeddings ---
+        uniad_kwargs = {}
+        if self.use_uniad_queries:
+            track_q = features.get("track_query_embeddings")
+            map_q = features.get("map_query_embeddings")
+            if track_q is not None:
+                uniad_kwargs["track_query_embeddings"] = track_q.to(model_dtype).cuda()
+                uniad_kwargs["track_query_mask"] = features.get("track_query_mask")
+                if uniad_kwargs["track_query_mask"] is not None:
+                    uniad_kwargs["track_query_mask"] = uniad_kwargs["track_query_mask"].cuda()
+            if map_q is not None:
+                uniad_kwargs["map_query_embeddings"] = map_q.to(model_dtype).cuda()
+                uniad_kwargs["map_query_mask"] = features.get("map_query_mask")
+                if uniad_kwargs["map_query_mask"] is not None:
+                    uniad_kwargs["map_query_mask"] = uniad_kwargs["map_query_mask"].cuda()
+
         if self.training and not self.grpo:
             action_inputs = BatchFeature(data={"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype), "action": targets["trajectory"].to(model_dtype)})
-            return self.action_head(last_hidden_state, action_inputs)
+            return self.action_head(last_hidden_state, action_inputs, **uniad_kwargs)
         elif self.training and self.grpo:
             action_inputs = BatchFeature(data={"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype), "action": targets["trajectory"].to(model_dtype)})
-            return self.action_head.forward_grpo(last_hidden_state, action_inputs, tokens_list)
-        else: 
+            return self.action_head.forward_grpo(last_hidden_state, action_inputs, tokens_list, **uniad_kwargs)
+        else:
             action_inputs = BatchFeature({"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype)})
-            return self.action_head.get_action(last_hidden_state.to(model_dtype), action_inputs)
+            return self.action_head.get_action(last_hidden_state.to(model_dtype), action_inputs, **uniad_kwargs)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         self.eval()
@@ -298,6 +319,8 @@ def make_recogdrive_config(
     num_inference_steps: int = 5,
     grpo: bool = False,
     model_dtype: str = "float16",
+    use_uniad_queries: bool = False,
+    uniad_query_dim: int = 256,
 ) -> ReCogDriveDiffusionPlannerConfig:
     """
     A factory function to create a ReCogDriveDiffusionPlannerConfig object.
@@ -344,6 +367,8 @@ def make_recogdrive_config(
         num_inference_steps=num_inference_steps,
         grpo=grpo,
         model_dtype=model_dtype,
+        use_uniad_queries=use_uniad_queries,
+        uniad_query_dim=uniad_query_dim,
     )
     
     return config

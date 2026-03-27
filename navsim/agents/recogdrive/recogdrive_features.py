@@ -22,7 +22,8 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
                  model_type: Optional[str] = None,
                  checkpoint_path: Optional[str] = None,
                  device: str = "cuda",
-                 cache_mode: bool = False, ):
+                 cache_mode: bool = False,
+                 use_uniad_queries: bool = False, ):
         """
         Initializes the feature builder.
 
@@ -40,6 +41,7 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
         self.cache_hidden_state = cache_hidden_state
         self.backbone = None
         self.cache_mode = cache_mode
+        self.use_uniad_queries = use_uniad_queries
 
         if self.cache_hidden_state and self.cache_mode:
             if not model_type or not checkpoint_path:
@@ -52,6 +54,18 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
 
     def get_unique_name(self) -> str:
         return "internvl_feature"
+
+    def _maybe_add_uniad_queries(self, result: Dict[str, torch.Tensor], agent_input: AgentInput) -> Dict[str, torch.Tensor]:
+        """Attach UniAD track/map query embeddings to feature dict if present."""
+        if not self.use_uniad_queries:
+            return result
+        track_q = getattr(agent_input, "track_query_embeddings", None)
+        map_q = getattr(agent_input, "map_query_embeddings", None)
+        if track_q is not None:
+            result["track_query_embeddings"] = torch.as_tensor(track_q, dtype=torch.float32).cpu()
+        if map_q is not None:
+            result["map_query_embeddings"] = torch.as_tensor(map_q, dtype=torch.float32).cpu()
+        return result
 
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
 
@@ -77,12 +91,13 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
             
             path_tensor = torch.tensor(path_as_ordinals, dtype=torch.long)
             
-            return {
+            result = {
                 "history_trajectory": history_trajectory.cpu(),
                 "high_command_one_hot": high_command_one_hot.cpu(),
                 "status_feature": status_feature.cpu(),
                 "image_path_tensor": path_tensor.cpu(),
             }
+            return self._maybe_add_uniad_queries(result, agent_input)
         else:
             if self.backbone is None:
                 raise RuntimeError("FeatureBuilder is in online mode, but the backbone was not initialized.")
@@ -104,12 +119,13 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
             outputs = self.backbone(pixel_values_cat.cuda(), questions, num_patches_list=num_patches_list)
             last_hidden_state = outputs.hidden_states[-1]
 
-            return {
+            result = {
                 "history_trajectory": history_trajectory.cpu(),
                 "high_command_one_hot": high_command_one_hot.cpu(),
                 "last_hidden_state": last_hidden_state.squeeze(0).float().cpu(),
                 "status_feature": status_feature.cpu(),
             }
+            return self._maybe_add_uniad_queries(result, agent_input)
 
 
 class TrajectoryTargetBuilder(AbstractTargetBuilder):

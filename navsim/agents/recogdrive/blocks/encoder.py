@@ -179,3 +179,49 @@ class StateAttentionEncoder(nn.Module):
         )
 
         return x_state.squeeze(1)
+
+
+class QueryAttentionPooling(nn.Module):
+    """
+    Pools a variable-length set of query embeddings (e.g. UniAD TrackQuery or
+    MapQuery) into a fixed-size embedding via cross-attention with a learnable
+    query token.
+
+    Input:  (B, N_queries, query_dim)   – N_queries can vary across samples
+    Output: (B, embed_dim)
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        embed_dim: int,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        self.proj = nn.Linear(query_dim, embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True,
+        )
+        self.query = nn.Parameter(torch.Tensor(1, 1, embed_dim))
+        self.norm = nn.LayerNorm(embed_dim)
+        nn.init.normal_(self.query, std=0.02)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, query_dim) – variable-length query embeddings.
+            key_padding_mask: (B, N) bool tensor, True = ignore.
+        Returns:
+            (B, embed_dim) – pooled embedding.
+        """
+        x = self.proj(x)                                       # (B, N, embed_dim)
+        query = self.query.expand(x.shape[0], -1, -1)          # (B, 1, embed_dim)
+        out, _ = self.attn(
+            query=query, key=x, value=x,
+            key_padding_mask=key_padding_mask,
+        )
+        return self.norm(out.squeeze(1))                        # (B, embed_dim)

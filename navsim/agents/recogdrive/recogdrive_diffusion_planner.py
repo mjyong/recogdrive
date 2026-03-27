@@ -44,6 +44,7 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import (
 
 from .blocks.encoder import (
     ActionEncoder,
+    QueryAttentionPooling,
     SinusoidalPositionalEncoding,
     StateAttentionEncoder,
     SwiGLUFFN,
@@ -113,7 +114,12 @@ class ReCogDriveDiffusionPlannerConfig(PretrainedConfig):
     
     tune_projector: bool = True
     tune_diffusion_model: bool = True
-    
+
+    # --- UniAD Query Integration ---
+    use_uniad_queries: bool = False
+    uniad_query_dim: int = 256          # UniAD embed_dims (track & map)
+    uniad_pooling_heads: int = 4        # attention heads in QueryAttentionPooling
+
     flow_cfg: FlowConfig = field(default_factory=FlowConfig)
     ddpm_cfg: DDPMConfig = field(default_factory=DDPMConfig)
     ddim_cfg: DDIMConfig = field(default_factory=DDIMConfig)
@@ -159,7 +165,24 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         else:
             self.feature_encoder = nn.Linear(1536, config.input_embedding_dim)
             
-        self.fusion_projector = nn.Linear(config.input_embedding_dim * 3, config.input_embedding_dim)
+        # --- UniAD Track / Map query integration ---
+        self.use_uniad_queries = config.use_uniad_queries
+        if self.use_uniad_queries:
+            self.track_query_pooling = QueryAttentionPooling(
+                query_dim=config.uniad_query_dim,
+                embed_dim=config.input_embedding_dim,
+                num_heads=config.uniad_pooling_heads,
+            )
+            self.map_query_pooling = QueryAttentionPooling(
+                query_dim=config.uniad_query_dim,
+                embed_dim=config.input_embedding_dim,
+                num_heads=config.uniad_pooling_heads,
+            )
+            fusion_in_dim = config.input_embedding_dim * 5   # vl + his + action + track + map
+        else:
+            fusion_in_dim = config.input_embedding_dim * 3   # vl + his + action
+
+        self.fusion_projector = nn.Linear(fusion_in_dim, config.input_embedding_dim)
 
         output_dim = 2 * config.action_dim if (
             config.sampling_method == 'flow' and config.flow_cfg.mean_variance_net
@@ -352,9 +375,64 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 self.fusion_projector.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
+                if self.use_uniad_queries:
+                    self.track_query_pooling.eval()
+                    self.map_query_pooling.eval()
             
             if not self.config.tune_diffusion_model:
                 self.model.eval()
+
+    def _encode_uniad_queries(
+        self,
+        track_query_embeddings: Optional[torch.Tensor],
+        map_query_embeddings: Optional[torch.Tensor],
+        track_query_mask: Optional[torch.Tensor] = None,
+        map_query_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encodes variable-length UniAD track / map queries into fixed-size
+        embeddings via attention pooling.
+
+        Args:
+            track_query_embeddings: (B, N_track, 256) or None
+            map_query_embeddings:   (B, N_map,   256) or None
+            track_query_mask:       (B, N_track) bool, True = padding
+            map_query_mask:         (B, N_map)   bool, True = padding
+
+        Returns:
+            track_embed: (B, input_embedding_dim)
+            map_embed:   (B, input_embedding_dim)
+        """
+        track_embed = self.track_query_pooling(
+            track_query_embeddings, key_padding_mask=track_query_mask,
+        )
+        map_embed = self.map_query_pooling(
+            map_query_embeddings, key_padding_mask=map_query_mask,
+        )
+        return track_embed, map_embed
+
+    def _build_fusion_input(
+        self,
+        his_traj_features: torch.Tensor,
+        vl_embeds_mean: torch.Tensor,
+        action_features: torch.Tensor,
+        track_embed: Optional[torch.Tensor] = None,
+        map_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Builds the fused input tensor for the DiT model.  When UniAD queries
+        are enabled the track / map embeddings are expanded to the action
+        horizon and concatenated alongside the other three streams before the
+        fusion projector.
+
+        Returns: (B, action_horizon, input_embedding_dim)
+        """
+        parts = [his_traj_features, vl_embeds_mean, action_features]
+        if self.use_uniad_queries and track_embed is not None and map_embed is not None:
+            T = action_features.shape[1]
+            parts.append(track_embed.unsqueeze(1).expand(-1, T, -1))
+            parts.append(map_embed.unsqueeze(1).expand(-1, T, -1))
+        return self.fusion_projector(torch.cat(parts, dim=2))
 
     def sample_time(self, batch_size, device, dtype):
         """Samples time for training based on the sampling method."""
@@ -375,7 +453,9 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         vl_features: torch.Tensor,
         his_traj_features: torch.Tensor,
         ego_status_features: torch.Tensor,
-        deterministic: bool = True
+        deterministic: bool = True,
+        track_embed: Optional[torch.Tensor] = None,
+        map_embed: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculates the mean and log variance of the reverse process p(x_{t-1} | x_t).
@@ -389,8 +469,9 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             action_features = action_features + self.position_embedding(pos_ids)
 
         vl_features_mean = vl_features.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
-        fused_input = self.fusion_projector(
-            torch.cat((his_traj_features, vl_features_mean, action_features), dim=2)
+        fused_input = self._build_fusion_input(
+            his_traj_features, vl_features_mean, action_features,
+            track_embed=track_embed, map_embed=map_embed,
         )
 
         model_output = self.model(
@@ -443,31 +524,51 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
         return model_mean, model_log_variance, x_recon
 
-    def forward(self, vl_features: torch.Tensor, action_input: BatchFeature) -> BatchFeature:
+    def forward(
+        self,
+        vl_features: torch.Tensor,
+        action_input: BatchFeature,
+        track_query_embeddings: Optional[torch.Tensor] = None,
+        map_query_embeddings: Optional[torch.Tensor] = None,
+        track_query_mask: Optional[torch.Tensor] = None,
+        map_query_mask: Optional[torch.Tensor] = None,
+    ) -> BatchFeature:
         """
         Computes the training loss for a given batch.
 
         Args:
-            vl_features (torch.Tensor): The vision-language features from the backbone.
-            action_input (BatchFeature): A batch containing ground truth actions and other conditioning.
+            vl_features: VLM hidden states (B, seq_len, vlm_dim).
+            action_input: Ground truth actions and conditioning.
+            track_query_embeddings: UniAD track queries (B, N_track, 256) or None.
+            map_query_embeddings:   UniAD map queries   (B, N_map, 256) or None.
+            track_query_mask: Padding mask for track queries (B, N_track).
+            map_query_mask:   Padding mask for map queries   (B, N_map).
 
         Returns:
-            BatchFeature: A batch containing the computed loss.
+            BatchFeature containing the computed loss.
         """
-        
+
         vl_embeds = self.feature_encoder(vl_features)
         his_traj_features = self.his_traj_encoder(
             action_input.his_traj.unsqueeze(1)
         ).repeat(1, self.config.action_horizon, 1)
         ego_status_features = self.ego_status_encoder(action_input.status_feature)
-        
+
+        # --- UniAD query encoding ---
+        track_embed, map_embed = None, None
+        if self.use_uniad_queries and track_query_embeddings is not None:
+            track_embed, map_embed = self._encode_uniad_queries(
+                track_query_embeddings, map_query_embeddings,
+                track_query_mask, map_query_mask,
+            )
+
         gt_actions = self.norm_odo(action_input.action)
 
         if self.config.sampling_method == 'flow':
             noise = torch.randn_like(gt_actions)
             t_cont = self.sample_time(gt_actions.shape[0], device=gt_actions.device, dtype=gt_actions.dtype)
             t_cont_reshaped = t_cont[:, None, None]
-            
+
             noisy_actions = (1 - t_cont_reshaped) * noise + t_cont_reshaped * gt_actions
             velocity_target = gt_actions - noise
             t_discrete = (t_cont * self.num_timestep_buckets).long()
@@ -476,34 +577,36 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             if hasattr(self, 'position_embedding'):
                 pos_ids = torch.arange(action_features.shape[1], device=gt_actions.device)
                 action_features += self.position_embedding(pos_ids)
-            
+
             vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
-            fused_input = self.fusion_projector(
-                torch.cat((his_traj_features, vl_embeds_mean, action_features), dim=2)
+            fused_input = self._build_fusion_input(
+                his_traj_features, vl_embeds_mean, action_features,
+                track_embed=track_embed, map_embed=map_embed,
             )
 
             model_output = self.model(fused_input, vl_embeds, ego_status_features, t_discrete)
             pred_velocity = self.action_decoder(model_output)
             loss = F.mse_loss(pred_velocity, velocity_target, reduction='mean')
-        else: 
+        else:
             noise = torch.randn_like(gt_actions)
             t_discrete = self.sample_time(gt_actions.shape[0], device=gt_actions.device, dtype=gt_actions.dtype)
-            
+
             noisy_actions = (
                 self.extract(self.ddpm_sqrt_alphas_cumprod, t_discrete, gt_actions.shape) * gt_actions +
                 self.extract(self.ddpm_sqrt_one_minus_alphas_cumprod, t_discrete, gt_actions.shape) * noise
             )
-            
+
             action_features = self.action_encoder(noisy_actions, t_discrete)
             if hasattr(self, 'position_embedding'):
                 pos_ids = torch.arange(action_features.shape[1], device=gt_actions.device)
                 action_features += self.position_embedding(pos_ids)
-            
+
             vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
-            fused_input = self.fusion_projector(
-                torch.cat((his_traj_features, vl_embeds_mean, action_features), dim=2)
+            fused_input = self._build_fusion_input(
+                his_traj_features, vl_embeds_mean, action_features,
+                track_embed=track_embed, map_embed=map_embed,
             )
-            
+
             model_output = self.model(fused_input, vl_embeds, ego_status_features, t_discrete)
             pred_noise = self.action_decoder(model_output)
             loss = F.mse_loss(pred_noise, noise, reduction='mean')
@@ -515,27 +618,30 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         vl_features: torch.Tensor,
         action_input: BatchFeature,
         init_actions: Optional[torch.Tensor] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        track_query_embeddings: Optional[torch.Tensor] = None,
+        map_query_embeddings: Optional[torch.Tensor] = None,
+        track_query_mask: Optional[torch.Tensor] = None,
+        map_query_mask: Optional[torch.Tensor] = None,
     ) -> BatchFeature:
         """
         Generates action trajectories via the configured sampling method.
 
-        This method strictly preserves the original logic for each sampler,
-        including specific clipping and noise handling for DDPM and DDIM.
-
         Args:
-            vl_features (torch.Tensor): Vision-language features from the backbone.
-            action_input (BatchFeature): Input containing conditioning features like
-                historical trajectory and ego status.
-            init_actions (Optional[torch.Tensor]): An initial trajectory to start
-                the denoising from. If None, starts from pure noise.
-            deterministic (bool): If True, DDIM sampling will be deterministic (eta=0).
+            vl_features: VLM hidden states (B, seq_len, vlm_dim).
+            action_input: Conditioning features (history, ego status).
+            init_actions: Optional initial trajectory to denoise from.
+            deterministic: If True, DDIM is deterministic (eta=0).
+            track_query_embeddings: UniAD track queries (B, N_track, 256).
+            map_query_embeddings:   UniAD map queries   (B, N_map, 256).
+            track_query_mask: Padding mask for track queries.
+            map_query_mask:   Padding mask for map queries.
 
         Returns:
-            BatchFeature: A batch containing the final predicted trajectory.
+            BatchFeature containing the predicted trajectory.
         """
         vl_embeds = self.feature_encoder(vl_features)
-        
+
         history_embeds = self.his_traj_encoder(
             action_input.his_traj.unsqueeze(1)
         ).repeat(1, self.config.action_horizon, 1)
@@ -544,9 +650,17 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             action_input.status_feature
         )
 
+        # --- UniAD query encoding ---
+        track_embed, map_embed = None, None
+        if self.use_uniad_queries and track_query_embeddings is not None:
+            track_embed, map_embed = self._encode_uniad_queries(
+                track_query_embeddings, map_query_embeddings,
+                track_query_mask, map_query_mask,
+            )
+
         B, D = vl_embeds.shape[0], self.config.action_dim
         device, dtype = vl_embeds.device, vl_embeds.dtype
-        
+
         current_actions = init_actions if init_actions is not None else torch.randn(
             (B, self.config.action_horizon, D), device=device, dtype=dtype
         )
@@ -560,15 +674,16 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 action_features = self.action_encoder(current_actions, t)
                 if hasattr(self, 'position_embedding'):
                     action_features += self.position_embedding(torch.arange(self.config.action_horizon, device=device))
-                
+
                 vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
-                fused_input = self.fusion_projector(
-                    torch.cat((history_embeds, vl_embeds_mean, action_features), dim=2)
+                fused_input = self._build_fusion_input(
+                    history_embeds, vl_embeds_mean, action_features,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
-                
+
                 model_output = self.model(fused_input, vl_embeds, ego_embeds, t)
                 pred = self.action_decoder(model_output)
-                
+
                 pred_flow = pred.chunk(2, dim=-1)[0] if self.config.flow_cfg.mean_variance_net else pred
                 current_actions = current_actions + dt * pred_flow
 
@@ -581,7 +696,8 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 index_batch = self.make_timesteps(B, i, device)
 
                 mean, logvar, _ = self.p_mean_variance(
-                    current_actions, t_batch, index_batch, vl_embeds, history_embeds, ego_embeds, deterministic
+                    current_actions, t_batch, index_batch, vl_embeds, history_embeds, ego_embeds, deterministic,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
 
                 noise_sample = torch.randn_like(current_actions)
@@ -598,7 +714,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                     noise_sample.clamp_(-self.eval_randn_clip_value, self.eval_randn_clip_value)
 
                 current_actions = mean + std * noise_sample
-                
+
                 if hasattr(self, 'final_action_clip_value') and self.final_action_clip_value is not None and i == len(timesteps_to_iterate) - 1:
                     current_actions.clamp_(-self.final_action_clip_value, self.final_action_clip_value)
 
@@ -610,7 +726,8 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 index_batch = self.make_timesteps(B, i, device)
 
                 mean, logvar, _ = self.p_mean_variance(
-                    current_actions, t_batch, index_batch, vl_embeds, history_embeds, ego_embeds, deterministic
+                    current_actions, t_batch, index_batch, vl_embeds, history_embeds, ego_embeds, deterministic,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
 
                 std = torch.exp(0.5 * logvar)
@@ -644,36 +761,36 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         his_traj_features: torch.Tensor,
         ego_status_features: torch.Tensor,
         init_actions: Optional[torch.Tensor] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        track_embed: Optional[torch.Tensor] = None,
+        map_embed: Optional[torch.Tensor] = None,
     ):
         """
         Generates the full denoising chain and the final trajectory.
-        This method reuses the logic from get_action but stores intermediate steps.
 
         Args:
-            vl_features (torch.Tensor): Vision-language features from the backbone.
-            his_traj_features (torch.Tensor): Encoded historical trajectory features.
-            ego_status_features (torch.Tensor): Encoded ego status features.
-            init_actions (Optional[torch.Tensor]): An initial trajectory to start from.
-                If None, starts from pure noise.
-            deterministic (bool): If True, DDIM sampling will be deterministic.
+            vl_features: Raw VLM features (B, seq_len, vlm_dim).
+            his_traj_features: Raw history trajectory (B, 12).
+            ego_status_features: Raw ego status (B, 8).
+            init_actions: Optional initial trajectory.
+            deterministic: Deterministic DDIM.
+            track_embed: Pre-pooled track query embedding (B, embed_dim) or None.
+            map_embed:   Pre-pooled map query embedding   (B, embed_dim) or None.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - The full denoising chain as a tensor of shape (B, K+1, H, D).
-                - The final, denormalized trajectory of shape (B, H, D).
+            (chain: (B, K+1, H, D), final_traj: (B, H, D))
         """
         B, D = vl_features.shape[0], self.config.action_dim
         device, dtype = vl_features.device, vl_features.dtype
-        
+
         vl_features = self.feature_encoder(vl_features)
-        
+
         his_traj_features = self.his_traj_encoder(
-            his_traj_features.unsqueeze(1)               
-        ).repeat(1, self.config.action_horizon, 1) 
+            his_traj_features.unsqueeze(1)
+        ).repeat(1, self.config.action_horizon, 1)
 
         ego_status_features = self.ego_status_encoder(
-            ego_status_features       
+            ego_status_features
         )
 
         current_actions = init_actions if init_actions is not None else torch.randn(
@@ -686,19 +803,20 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             for step in range(self.config.num_inference_steps):
                 idx = int(step / self.config.num_inference_steps * self.config.flow_cfg.num_timestep_buckets)
                 t_batch = torch.full((B,), idx, device=device, dtype=torch.long)
-                
+
                 action_features = self.action_encoder(current_actions, t_batch)
                 if hasattr(self, 'position_embedding'):
                     action_features += self.position_embedding(torch.arange(self.config.action_horizon, device=device))
-                
+
                 vl_features_mean = vl_features.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
-                fused_input = self.fusion_projector(
-                    torch.cat((his_traj_features, vl_features_mean, action_features), dim=2)
+                fused_input = self._build_fusion_input(
+                    his_traj_features, vl_features_mean, action_features,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
-                
+
                 model_output = self.model(fused_input, vl_features, ego_status_features, t_batch)
                 pred = self.action_decoder(model_output)
-                
+
                 pred_flow = pred.chunk(2, dim=-1)[0] if self.config.flow_cfg.mean_variance_net else pred
                 current_actions = current_actions + dt * pred_flow
                 denoising_chain.append(current_actions.clone())
@@ -707,15 +825,16 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             if self.config.sampling_method == 'ddpm':
                 step_size = self.config.ddpm_cfg.num_train_timesteps // self.config.num_inference_steps
                 timesteps = list(reversed(range(0, self.config.ddpm_cfg.num_train_timesteps, step_size)))
-            else: 
+            else:
                 timesteps = self.ddim_t
-            
+
             for i, t_int in enumerate(timesteps):
                 t_batch = self.make_timesteps(B, t_int, device)
                 index_batch = self.make_timesteps(B, i, device) if self.config.sampling_method == 'ddim' else t_batch
 
                 mean, logvar, _ = self.p_mean_variance(
-                    current_actions, t_batch, index_batch, vl_features, his_traj_features, ego_status_features, deterministic
+                    current_actions, t_batch, index_batch, vl_features, his_traj_features, ego_status_features, deterministic,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
 
                 std = torch.exp(0.5 * logvar).to(dtype)
@@ -757,28 +876,33 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         his_traj_features: torch.Tensor,
         ego_status_features: torch.Tensor,
         chains: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        track_embed: Optional[torch.Tensor] = None,
+        map_embed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculates the log probability of a full denoising chain."""
         B, K1, H, D = chains.shape
         num_denoising_steps = K1 - 1
-        
+
         vl_features = self.feature_encoder(vl_features)
 
         his_traj_features = self.his_traj_encoder(
-            his_traj_features.unsqueeze(1)          
-        ).repeat(1, self.config.action_horizon, 1) 
+            his_traj_features.unsqueeze(1)
+        ).repeat(1, self.config.action_horizon, 1)
 
         ego_status_features = self.ego_status_encoder(
-            ego_status_features      
+            ego_status_features
         )
 
         conditioning_embeds = {
             'vl_features': vl_features,
             'his_traj_features': his_traj_features,
-            'ego_status_features': ego_status_features
+            'ego_status_features': ego_status_features,
         }
-        
+        if self.use_uniad_queries and track_embed is not None:
+            conditioning_embeds['track_embed'] = track_embed
+            conditioning_embeds['map_embed'] = map_embed
+
         batched_conditioning = {}
         for key, value in conditioning_embeds.items():
             batched_conditioning[key] = value.unsqueeze(1).repeat(
@@ -807,7 +931,9 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             batched_conditioning['vl_features'],
             batched_conditioning['his_traj_features'],
             batched_conditioning['ego_status_features'],
-            deterministic=deterministic
+            deterministic=deterministic,
+            track_embed=batched_conditioning.get('track_embed'),
+            map_embed=batched_conditioning.get('map_embed'),
         )
 
         std = torch.exp(0.5 * logvar).clamp(min=self.min_logprob_denoising_std)
@@ -824,19 +950,36 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         sample_time: int = 8,
         deterministic=False,
         bc_coeff: float = 0.1,
-        use_bc_loss: bool = True
+        use_bc_loss: bool = True,
+        track_query_embeddings: Optional[torch.Tensor] = None,
+        map_query_embeddings: Optional[torch.Tensor] = None,
+        track_query_mask: Optional[torch.Tensor] = None,
+        map_query_mask: Optional[torch.Tensor] = None,
     ) -> BatchFeature:
         """Computes the Diffusion-GRPO loss."""
         self.set_frozen_modules_to_eval_mode()
         B = vl_features.shape[0]
-        G = sample_time 
+        G = sample_time
+
+        # --- UniAD query encoding (once, then repeat) ---
+        track_embed, map_embed = None, None
+        if self.use_uniad_queries and track_query_embeddings is not None:
+            track_embed, map_embed = self._encode_uniad_queries(
+                track_query_embeddings, map_query_embeddings,
+                track_query_mask, map_query_mask,
+            )
+            track_embed_rep = track_embed.repeat_interleave(G, 0)
+            map_embed_rep = map_embed.repeat_interleave(G, 0)
+        else:
+            track_embed_rep, map_embed_rep = None, None
 
         vl_features_rep = vl_features.repeat_interleave(G, 0)
         his_traj_rep = action_input.his_traj.repeat_interleave(G, 0)
         status_feature_rep = action_input.status_feature.repeat_interleave(G, 0)
 
         chains, trajs = self.sample_chain(
-            vl_features_rep, his_traj_rep, status_feature_rep, deterministic=False
+            vl_features_rep, his_traj_rep, status_feature_rep, deterministic=False,
+            track_embed=track_embed_rep, map_embed=map_embed_rep,
         )
 
         tokens_rep = [tok for tok in tokens_list for _ in range(G)]
@@ -852,7 +995,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         mean_r = rewards_matrix.mean(dim=1, keepdim=True)
         std_r = rewards_matrix.std(dim=1, keepdim=True) + 1e-8
         advantages = ((rewards_matrix - mean_r) / std_r).view(-1).detach()
-        
+
         adv_min = torch.quantile(advantages, self.clip_advantage_lower_quantile)
         adv_max = torch.quantile(advantages, self.clip_advantage_upper_quantile)
         advantages = advantages.clamp(min=adv_min, max=adv_max)
@@ -860,15 +1003,17 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         num_denoising_steps = chains.shape[1] - 1
         denoising_indices = torch.arange(num_denoising_steps, device=advantages.device)
         discount = (self.gamma_denoising ** (num_denoising_steps - denoising_indices - 1))
-    
-        
-        adv_steps = advantages.view(B, G, 1).expand(-1, -1, num_denoising_steps)  
-        discount = discount.view(1, 1, num_denoising_steps).expand(B, G, num_denoising_steps)  
-        adv_weighted_flat = (adv_steps * discount).reshape(-1)             
 
-        log_probs = self.get_logprobs(vl_features_rep, his_traj_rep, status_feature_rep, chains, deterministic=False)
+        adv_steps = advantages.view(B, G, 1).expand(-1, -1, num_denoising_steps)
+        discount = discount.view(1, 1, num_denoising_steps).expand(B, G, num_denoising_steps)
+        adv_weighted_flat = (adv_steps * discount).reshape(-1)
+
+        log_probs = self.get_logprobs(
+            vl_features_rep, his_traj_rep, status_feature_rep, chains, deterministic=False,
+            track_embed=track_embed_rep, map_embed=map_embed_rep,
+        )
         log_probs = log_probs.clamp(min=-5, max=2).mean(dim=[1, 2])
-        
+
         policy_loss = -torch.mean(log_probs * adv_weighted_flat)
         total_loss = policy_loss
 
@@ -876,9 +1021,13 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         if use_bc_loss:
             with torch.no_grad():
                 teacher_chains, _ = self.old_policy.sample_chain(
-                    vl_features, action_input.his_traj, action_input.status_feature, deterministic=False
+                    vl_features, action_input.his_traj, action_input.status_feature, deterministic=False,
+                    track_embed=track_embed, map_embed=map_embed,
                 )
-            bc_logp = self.get_logprobs(vl_features, action_input.his_traj, action_input.status_feature, teacher_chains, deterministic=False)
+            bc_logp = self.get_logprobs(
+                vl_features, action_input.his_traj, action_input.status_feature, teacher_chains, deterministic=False,
+                track_embed=track_embed, map_embed=map_embed,
+            )
             bc_logp = bc_logp.clamp(min=-5, max=2)
             K_steps = chains.shape[1] - 1
             bc_logp = bc_logp.view(-1, K_steps, chains.shape[2], chains.shape[3]).mean(dim=[1,2,3])
